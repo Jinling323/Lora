@@ -1,0 +1,54 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local configuration
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Editors, operating systems, and local agent settings
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.agents/
+.codex/
+
+# Local datasets
+/data/
+/dataset/
+
+# Training outputs, checkpoints, and logs
+/model/
+/checkpoints/
+/outputs/
+/runs/
+/logs/
+/tmp/
+/test/
+*.pth
+*.pt
+*.ckpt
+*_ckpt.tar
+*.log
+events.out.tfevents.*
+
+# Generated arrays and experiment artifacts
+*.npy
+*.npz
+
+# Local archives and reference documents
+*.zip
+*.7z
+*.rar
+*.pdf
