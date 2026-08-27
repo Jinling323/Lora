@@ -15,9 +15,9 @@ def parse_args():
                         help='directory to save models.')
     parser.add_argument('--save-all', type=bool, default=False,
                         help='whether to save all best model')
-    parser.add_argument('--pretrain-lr', type=float, default=1e-5,
+    parser.add_argument('--pretrain-lr', type=float, default=5*1e-6,
                         help='learning rate for base-model pretraining')
-    parser.add_argument('--pretrain-weight-decay', type=float, default=1e-4,
+    parser.add_argument('--pretrain-weight-decay', type=float, default=1e-5,
                         help='weight decay for base-model pretraining')
     parser.add_argument('--resume', default='',
                         help='the path of resume training model')
