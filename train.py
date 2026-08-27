@@ -4,7 +4,9 @@ import os
 import torch
 args = None
 
+# 設定「執行訓練程式時可以從終端機傳入的參數」
 def parse_args():
+    # 建立參數解析器
     parser = argparse.ArgumentParser(description='Train ')
     parser.add_argument('--model-name', default='vgg19_trans', help='the name of the model')
     parser.add_argument('--pretrain-data-dir', default=r'/media/mmslab-1080/37E8097A1DE5832D/Kuan-Lun/counting_data/mix_data/ShanghaiTech_A_Train_Val_Test',
@@ -77,6 +79,6 @@ if __name__ == '__main__':
     args = parse_args()
     torch.backends.cudnn.benchmark = True
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device.strip()  # set vis gpu
-    trainer = RegTrainer(args)
+    trainer = RegTrainer(args)   # train.py 本身不負責寫完整訓練流程，而是交給 RegTrainer
     trainer.setup()
     trainer.train()

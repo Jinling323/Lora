@@ -4,11 +4,16 @@ import sys
 import time 
 from math import ceil  
 
+# This machine's protobuf C++ extension requires a newer libstdc++; the pure
+# Python implementation keeps TensorBoard usable without changing training.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import numpy as np  
 import torch  
 from torch import optim  
 from torch.utils.data import DataLoader  
 from torch.utils.data.dataloader import default_collate  
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from utils.helper import AverageMeter, Save_Handle 
@@ -137,6 +142,13 @@ class RegTrainer(Trainer):
         if args.resume:  # 使用者有提供 checkpoint 時才執行
             self._load_resume(args.resume)  # 載入模型、optimizer 與起始 epoch。
 
+        # TensorBoard logs are kept with the checkpoints and train.log for
+        # this run. Base and LoRA use separate tags, so their epoch counters
+        # can both start at zero without mixing the curves.
+        self.tensorboard_dir = os.path.join(self.save_dir, "tensorboard")
+        self.writer = SummaryWriter(log_dir=self.tensorboard_dir)
+        logging.info("TensorBoard log directory: %s", self.tensorboard_dir)
+
     # 從指定根目錄建立 train 與 val datasets
     def _make_datasets(self, data_dir):  
         args = self.args  
@@ -167,12 +179,16 @@ class RegTrainer(Trainer):
         }
 
     def train(self):  # 依序執行 base pretrain 與 LoRA/router fine-tuning。
-        self._run_stage("base")  # 先訓練 base pretrain。
-        if self.stages["base"]["epochs"] > 0 and self.load_best_base_before_lora:  # 完整流程才需要切到最佳 base。
-            self._load_best_base_before_lora()  # 以 validation 最佳 base 作為 LoRA 起點。
-        self.stages["base"]["optimizer"].state.clear()  
-        torch.cuda.empty_cache()  # 刪除 Base Adam optimizer 的 moments，釋放 GPU 記憶體
-        self._run_stage("lora")  # 接著執行或恢復 LoRA/router 訓練。
+        try:
+            self._run_stage("base")  # 先訓練 base pretrain。
+            if self.stages["base"]["epochs"] > 0 and self.load_best_base_before_lora:  # 完整流程才需要切到最佳 base。
+                self._load_best_base_before_lora()  # 以 validation 最佳 base 作為 LoRA 起點。
+            self.stages["base"]["optimizer"].state.clear()
+            torch.cuda.empty_cache()  # 刪除 Base Adam optimizer 的 moments，釋放 GPU 記憶體
+            self._run_stage("lora")  # 接著執行或恢復 LoRA/router 訓練。
+        finally:
+            # Also close the event file when training exits because of an error.
+            self.writer.close()
 
     def _run_stage(self, stage_name):  # 使用同一個流程執行 base 或 LoRA 階段。
         stage = self.stages[stage_name]  # 取得此階段集中管理的設定。
@@ -250,6 +266,23 @@ class RegTrainer(Trainer):
             mae_meter.get_avg(),  
             time.time() - start_time,  
         )
+        tensorboard_prefix = "Base" if stage_name == "base" else "LoRA"
+        self.writer.add_scalar(
+            "{}/Train_Loss".format(tensorboard_prefix),
+            loss_meter.get_avg(),
+            self.epoch,
+        )
+        self.writer.add_scalar(
+            "{}/Train_MAE".format(tensorboard_prefix),
+            mae_meter.get_avg(),
+            self.epoch,
+        )
+        self.writer.add_scalar(
+            "{}/Train_RMSE".format(tensorboard_prefix),
+            np.sqrt(mse_meter.get_avg()),
+            self.epoch,
+        )
+        self.writer.flush()
         self._save_checkpoint(stage_name, stage)  # 每個 epoch 結束保存可續訓 checkpoint。
 
     @staticmethod
@@ -308,6 +341,14 @@ class RegTrainer(Trainer):
             mae,  # Validation MAE。
             time.time() - start_time,  # Validation 花費秒數。
         )
+        tensorboard_prefix = "Base" if stage_name == "base" else "LoRA"
+        self.writer.add_scalar(
+            "{}/Val_MAE".format(tensorboard_prefix), mae, self.epoch
+        )
+        self.writer.add_scalar(
+            "{}/Val_RMSE".format(tensorboard_prefix), mse, self.epoch
+        )
+        self.writer.flush()
         # 指標刷新時保存此階段最佳模型。
         self._save_best(stage_name, mse, mae)  
         return mse, mae  
