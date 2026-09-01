@@ -38,24 +38,24 @@ class TopKRouter(nn.Module):
 
         self.num_experts = num_experts
         self.top_k = top_k
-        self.proj = nn.Linear(input_dim, num_experts) #算出每個expert的router score
+        self.proj = nn.Linear(input_dim, num_experts) # 算出每個expert的router score
 
-        #用來修正每個expert的router score的bias，它是從routing統計數據更新，而不是通過反向傳播更新
+        # 用來修正每個expert的router score的bias，它是從routing統計數據更新，而不是通過反向傳播更新
         self.register_buffer("expert_bias", torch.zeros(num_experts))   
-        #這個是用來統計每個expert在當前batch中被選中的次數，並且不會被保存到模型的state_dict中。
+        # 這個是用來統計每個expert在當前batch中被選中的次數，並且不會被保存到模型的state_dict中。
         self.register_buffer(
             "_batch_load", torch.zeros(num_experts), persistent=False
         ) 
 
-    #每個optimizer step之前清除路由統計數據，否則舊的誤差會被重複使用，導致bias更新不正確
+    # 每個optimizer step之前清除路由統計數據，否則舊的誤差會被重複使用，導致bias更新不正確
     def reset_load(self): 
         """Clear routing counts before processing a new optimizer step."""
         self._batch_load.zero_()
 
     #更新每個expert的bias，根據每個expert的負載情況進行調整。
-    #它計算平均負載，然後將每個expert的負載與平均負載相減再除上平均負載，計算出負載誤差
+    #它計算平均負載，然後將每個expert的負載與平均負載相減，計算出負載誤差
     #並根據update_rate更新bias。
-    @torch.no_grad()
+    @torch.no_grad()   # 不用建立梯度計算紀錄
     def update_expert_bias(self, update_rate):
         """Update bias proportionally to each expert's load violation."""
         average_load = self._batch_load.mean()  #計算平均負載
@@ -63,28 +63,31 @@ class TopKRouter(nn.Module):
             return 0.0
 
         load_error = average_load - self._batch_load    #計算每個expert的負載誤差（最重要）
-        self.expert_bias.add_(load_error, alpha=update_rate) #expert_bias += update_rate * load_error
-        max_violation = (self._batch_load.max() - average_load) / average_load #負載平衡指標（觀察用）
+        self.expert_bias.add_(load_error, alpha=update_rate) # expert_bias += update_rate * load_error
+        max_violation = (self._batch_load.max() - average_load) / average_load #負載平衡指標（觀察用） （最忙的 expert比平均負載高出多少比例）
         return max_violation.item()
 
     #加上動態bias的分數選擇top-k，再用原始logits計算softmax
     def forward(self, x):   
-        logits = self.proj(x)
-        selection_logits = logits + self.expert_bias.to(dtype=logits.dtype)
+        logits = self.proj(x)     # x：token feature、self.proj：Router 的 Linear、logits：每個 token 對所有 experts 的原始分數（偏好程度）
+        selection_logits = logits + self.expert_bias.to(dtype=logits.dtype)   # 原始分數加上 bias
+        # 選擇的專家
         top_indices = torch.topk(
             selection_logits, self.top_k, dim=-1
         ).indices
         
-        top_logits = logits.gather(dim=-1, index=top_indices) #gather會根據top_indices選出對應的logits，這些logits是用來計算softmax的
+        # 根據 top_indices 記錄的 expert 編號，從 logits 中取出這些 expert 的原始分數
+        top_logits = logits.gather(dim=-1, index=top_indices) 
+        # 用原始分數計算選中 experts 的融合權重
         top_weights = F.softmax(top_logits.float(), dim=-1).to(logits.dtype)
 
-        if self.training: 
+        if self.training:  # 訓練模式才執行下面的負載統計
             #統計每個 expert ID被選到的次數  
-            load = torch.bincount( 
+            load = torch.bincount(    # 統計每個 ID 出現幾次
                 top_indices.detach().reshape(-1), minlength=self.num_experts
             ).to(self._batch_load.dtype)
             self._batch_load.add_(load)
-        return top_indices, top_weights #top_indices:選中了哪幾個expert、top_weights:expert各自佔多少比例
+        return top_indices, top_weights # 每個 token 選了哪些 experts 和那些 experts 的權重
 
 
 class LoRAMoELinear(nn.Module):

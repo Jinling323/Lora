@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from utils.logger import setlogger
 
-
+# 建立本次實驗的儲存資料夾、設定 log，並保存 args
 class Trainer(object):
     def __init__(self, args):
         sub_dir = datetime.strftime(datetime.now(), '%m%d-%H%M%S')  # prepare saving path

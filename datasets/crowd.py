@@ -27,14 +27,18 @@ def cal_innner_area(c_left, c_up, c_right, c_down, bbox):
     return inner_area
 
 
-
+# 讀取圖片和人頭標註
 class Crowd(data.Dataset):
+    # 尋找所有 .jpg、保存裁切大小，並建立圖片正規化
     def __init__(self, root_path, crop_size,
                  downsample_ratio, is_gray=False,
                  method='train'):
 
         self.root_path = root_path
-        self.im_list = sorted(glob(os.path.join(self.root_path, '*.jpg')))
+        self.im_list = sorted(
+            path for path in glob(os.path.join(self.root_path, '*.jpg'))
+            if not os.path.basename(path).startswith('._')
+        )
         if method not in ['train', 'val']:
             raise Exception("not implement")
         self.method = method
@@ -58,6 +62,7 @@ class Crowd(data.Dataset):
     def __len__(self):
         return len(self.im_list)
 
+    # 讀取指定圖片及同名 .npy 人頭座標
     def __getitem__(self, item):
         img_path = self.im_list[item]
         gd_path = img_path.replace('jpg', 'npy')
@@ -99,6 +104,7 @@ class Crowd(data.Dataset):
             nearest_distance = distances[:, 1:].mean(axis=1, keepdims=True).astype(np.float32)
         return np.concatenate((points, nearest_distance), axis=1)
 
+    # 訓練資料增強
     def train_transform(self, img, keypoints):
         """random crop image patch and find people in it"""
         wd, ht = img.size
@@ -141,3 +147,115 @@ class Crowd(data.Dataset):
                 img = F.hflip(img)
         return self.trans(img), torch.from_numpy(keypoints.copy()).float(), \
                torch.from_numpy(target.copy()).float(), st_size
+
+
+class PairedCrowd(Crowd):
+    """Return geometrically aligned clean/hazy crops for LoRA training."""
+
+    def __init__(self, clean_root_path, hazy_root_path, crop_size,
+                 downsample_ratio, is_gray=False):
+        super().__init__(
+            clean_root_path,
+            crop_size,
+            downsample_ratio,
+            is_gray,
+            method='train',
+        )
+        hazy_paths = [
+            path for path in glob(os.path.join(hazy_root_path, '*.jpg'))
+            if not os.path.basename(path).startswith('._')
+        ]
+        self.hazy_by_name = {
+            self._pair_name(path): path for path in hazy_paths
+        }
+        missing = [
+            path for path in self.im_list
+            if self._pair_name(path) not in self.hazy_by_name
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "missing hazy pairs for {} clean images; first missing pair: {}".format(
+                    len(missing), missing[0]
+                )
+            )
+
+    @staticmethod
+    def _pair_name(path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        return name[len('hazy_'):] if name.startswith('hazy_') else name
+
+    def __getitem__(self, item):
+        clean_path = self.im_list[item]
+        hazy_path = self.hazy_by_name[self._pair_name(clean_path)]
+        annotation_path = os.path.splitext(clean_path)[0] + '.npy'
+
+        clean_img = Image.open(clean_path).convert('RGB')
+        hazy_img = Image.open(hazy_path).convert('RGB')
+        if clean_img.size != hazy_img.size:
+            raise ValueError(
+                "paired images have different sizes: {} {} vs {} {}".format(
+                    clean_path, clean_img.size, hazy_path, hazy_img.size
+                )
+            )
+
+        keypoints = np.load(annotation_path)
+        keypoints = self._ensure_nearest_distance(keypoints, annotation_path)
+        return self.paired_train_transform(clean_img, hazy_img, keypoints)
+
+    def paired_train_transform(self, clean_img, hazy_img, keypoints):
+        """Apply identical resize, crop, grayscale, and flip to both domains."""
+        wd, ht = clean_img.size
+        if random.random() > 0.88:
+            clean_img = clean_img.convert('L').convert('RGB')
+            hazy_img = hazy_img.convert('L').convert('RGB')
+
+        re_size = random.random() * 0.5 + 0.75
+        resized_width = int(wd * re_size)
+        resized_height = int(ht * re_size)
+        if min(resized_width, resized_height) >= self.c_size:
+            wd = resized_width
+            ht = resized_height
+            clean_img = clean_img.resize((wd, ht))
+            hazy_img = hazy_img.resize((wd, ht))
+            keypoints = keypoints * re_size
+
+        st_size = min(wd, ht)
+        if st_size < self.c_size:
+            raise ValueError(
+                "image is smaller than crop size: image min side {}, crop {}".format(
+                    st_size, self.c_size
+                )
+            )
+
+        i, j, h, w = random_crop(ht, wd, self.c_size, self.c_size)
+        clean_img = F.crop(clean_img, i, j, h, w)
+        hazy_img = F.crop(hazy_img, i, j, h, w)
+
+        if len(keypoints) > 0:
+            nearest_dis = np.clip(keypoints[:, 2], 4.0, 128.0)
+            points_left_up = keypoints[:, :2] - nearest_dis[:, None] / 2.0
+            points_right_down = keypoints[:, :2] + nearest_dis[:, None] / 2.0
+            bbox = np.concatenate((points_left_up, points_right_down), axis=1)
+            inner_area = cal_innner_area(j, i, j + w, i + h, bbox)
+            origin_area = nearest_dis * nearest_dis
+            ratio = np.clip(inner_area / origin_area, 0.0, 1.0)
+            mask = ratio >= 0.3
+            target = ratio[mask]
+            keypoints = keypoints[mask]
+            keypoints = keypoints[:, :2] - [j, i]
+        else:
+            target = np.array([])
+
+        if random.random() > 0.5:
+            clean_img = F.hflip(clean_img)
+            hazy_img = F.hflip(hazy_img)
+            if len(keypoints) > 0:
+                keypoints[:, 0] = w - keypoints[:, 0]
+
+        return (
+            self.trans(clean_img),
+            self.trans(hazy_img),
+            torch.from_numpy(keypoints.copy()).float(),
+            torch.from_numpy(target.copy()).float(),
+            st_size,
+        )

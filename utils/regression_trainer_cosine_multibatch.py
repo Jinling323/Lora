@@ -11,6 +11,7 @@ os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import numpy as np  
 import torch  
 from torch import optim  
+from torch.nn import functional as F
 from torch.utils.data import DataLoader  
 from torch.utils.data.dataloader import default_collate  
 from torch.utils.tensorboard import SummaryWriter
@@ -20,7 +21,7 @@ from utils.helper import AverageMeter, Save_Handle
 from utils.trainer import Trainer 
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..")) 
-from datasets.crowd import Crowd  
+from datasets.crowd import Crowd, PairedCrowd
 from losses.bay_loss import Bay_Loss  
 from losses.post_prob import Post_Prob 
 from models import vgg_c_multibatch as vgg  
@@ -35,6 +36,16 @@ def train_collate(batch):
     return images, points, targets, st_sizes  
 
 
+def paired_train_collate(batch):
+    columns = list(zip(*batch))
+    clean_images = torch.stack(columns[0], dim=0)
+    hazy_images = torch.stack(columns[1], dim=0)
+    points = columns[2]
+    targets = columns[3]
+    st_sizes = torch.FloatTensor(columns[4])
+    return clean_images, hazy_images, points, targets, st_sizes
+
+
 class RegTrainer(Trainer):  
     def setup(self): 
         args = self.args  
@@ -46,13 +57,17 @@ class RegTrainer(Trainer):
         assert self.device_count == 1, "only single-GPU training is supported" 
         logging.info("using %s gpu", self.device_count)  
 
-        self.datasets = self._make_datasets(args.train_data_dir)
-        self.dataloaders = self._make_dataloaders(self.datasets) 
         pretrain_data_dir = args.pretrain_data_dir or args.train_data_dir  
-        same_data = os.path.abspath(pretrain_data_dir) == os.path.abspath(args.train_data_dir)  
-        self.pretrain_datasets = self.datasets if same_data else self._make_datasets(pretrain_data_dir) 
-        self.pretrain_dataloaders = self.dataloaders if same_data else self._make_dataloaders(self.pretrain_datasets)  
+        self.pretrain_datasets = self._make_datasets(pretrain_data_dir)
+        self.pretrain_dataloaders = self._make_dataloaders(self.pretrain_datasets)
+        self.datasets = self._make_lora_datasets(
+            pretrain_data_dir,
+            args.train_data_dir,
+        )
+        self.dataloaders = self._make_dataloaders(self.datasets)
         logging.info("pretrain data directory: %s", pretrain_data_dir)  
+        logging.info("LoRA clean data directory: %s", pretrain_data_dir)
+        logging.info("LoRA hazy data directory: %s", args.train_data_dir)
 
         self.model = vgg.vgg19_trans(  
             num_experts=4,  
@@ -119,6 +134,8 @@ class RegTrainer(Trainer):
                 raise ValueError("validation interval must be greater than zero")  
         if args.router_bias_update_rate < 0: #檢查args.router_bias_update_rate是否小於0
             raise ValueError("router bias update rate must be non-negative")
+        if args.cs_loss_weight < 0:
+            raise ValueError("cs loss weight must be non-negative")
 
         self.start_epochs = {"base": 0, "lora": 0}  # 預設兩階段都從 epoch 0 開始。
         self.best = {  # 分別追蹤 base 與 LoRA 的最佳 validation 結果。
@@ -163,13 +180,37 @@ class RegTrainer(Trainer):
             for split in ("train", "val")  
         }
 
+    def _make_lora_datasets(self, clean_data_dir, hazy_data_dir):
+        args = self.args
+        return {
+            "train": PairedCrowd(
+                os.path.join(clean_data_dir, "train"),
+                os.path.join(hazy_data_dir, "train"),
+                args.crop_size,
+                args.downsample_ratio,
+                args.is_gray,
+            ),
+            "val": Crowd(
+                os.path.join(hazy_data_dir, "val"),
+                args.crop_size,
+                args.downsample_ratio,
+                args.is_gray,
+                "val",
+            ),
+        }
+
     # 將 train/val datasets 包裝成 dataloaders
     def _make_dataloaders(self, datasets):  
         args = self.args  
         return { 
             split: DataLoader(  
                 datasets[split],  
-                collate_fn=train_collate if split == "train" else default_collate,  
+                collate_fn=(
+                    paired_train_collate
+                    if split == "train" and isinstance(datasets[split], PairedCrowd)
+                    else train_collate if split == "train"
+                    else default_collate
+                ),
                 batch_size=args.batch_size if split == "train" else 1, 
                 shuffle=split == "train",  
                 num_workers=args.num_workers * self.device_count,  
@@ -218,20 +259,44 @@ class RegTrainer(Trainer):
             unit="batch",
             dynamic_ncols=True,
         )
-        for inputs, points, targets, st_sizes in progress:  
+        for batch in progress:
             optimizer.zero_grad()  # 清除此 optimizer 上一個 batch 的 gradients。
             if stage_name == "lora": # LoRA/router 階段才需要清除路由統計數據
                 self.model.reset_router_loads()
-            inputs = inputs.to(self.device)  
+
+            if stage_name == "base":
+                inputs, points, targets, st_sizes = batch
+                inputs = inputs.to(self.device)
+                outputs, features = self.model(inputs)
+                auxiliary_loss = self._consistency_loss(features, outputs)
+            else:
+                clean_inputs, inputs, points, targets, st_sizes = batch
+                clean_inputs = clean_inputs.to(self.device)
+                inputs = inputs.to(self.device)
+
+                # Clean teacher: frozen baseline with LoRA disabled.
+                self.model.enable_lora(False)
+                self.model.eval()
+                with torch.no_grad():
+                    _, clean_features = self.model(clean_inputs)
+
+                # Hazy student: only LoRA experts/router are trainable.
+                self.model.enable_lora(True)
+                self.model.train()
+                outputs, features = self.model(inputs)
+                auxiliary_loss = self.args.cs_loss_weight * self._clean_hazy_cs_loss(
+                    features,
+                    clean_features,
+                )
+
             st_sizes = st_sizes.to(self.device) 
             ground_truth = np.asarray([len(point) for point in points], dtype=np.float32) 
             points = [point.to(self.device) for point in points]  
             targets = [target.to(self.device) for target in targets]  
 
-            outputs, features = self.model(inputs)  
             probabilities = self.post_prob(points, st_sizes)  
             bayesian_loss = self.criterion(probabilities, targets, outputs)  
-            loss = bayesian_loss + self._consistency_loss(features, outputs)  
+            loss = bayesian_loss + auxiliary_loss
             loss.backward() 
             optimizer.step()  
             router_maxvio = None
@@ -297,6 +362,38 @@ class RegTrainer(Trainer):
                 cosine_distance = 1 - torch.sum(feature * mean_feature, dim=1) / (mean_norm * feature_norm + 1e-5)  
                 total = total + cosine_distance.sum()  
         return total  # 回傳 scalar loss。
+
+    @staticmethod
+    def _clean_hazy_cs_loss(hazy_features, clean_features):
+        """Align LoRA-affected hazy features with detached clean features."""
+        if len(hazy_features) != len(clean_features):
+            raise ValueError("clean and hazy feature layer counts do not match")
+
+        layer_losses = []
+        for hazy_feature, clean_feature in zip(hazy_features, clean_features):
+            if hazy_feature.shape != clean_feature.shape:
+                raise ValueError(
+                    "clean and hazy feature shapes do not match: {} vs {}".format(
+                        tuple(clean_feature.shape), tuple(hazy_feature.shape)
+                    )
+                )
+            # The first returned feature is formed before the first LoRA FFN,
+            # so only align features that can propagate gradients to LoRA.
+            if not hazy_feature.requires_grad:
+                continue
+            layer_losses.append(
+                1.0
+                - F.cosine_similarity(
+                    hazy_feature,
+                    clean_feature.detach(),
+                    dim=-1,
+                    eps=1e-8,
+                ).mean()
+            )
+
+        if not layer_losses:
+            raise RuntimeError("no returned feature is connected to LoRA parameters")
+        return torch.stack(layer_losses).mean()
 
     # 驗證 base-only 或 frozen-base + LoRA/router
     def _validate(self, stage_name, dataloader):  

@@ -9,9 +9,9 @@ def parse_args():
     # 建立參數解析器
     parser = argparse.ArgumentParser(description='Train ')
     parser.add_argument('--model-name', default='vgg19_trans', help='the name of the model')
-    parser.add_argument('--pretrain-data-dir', default=r'/media/mmslab-1080/37E8097A1DE5832D/Kuan-Lun/counting_data/mix_data/ShanghaiTech_A_Train_Val_Test',
-                        help='pretrain data directory')
-    parser.add_argument('--save-dir', default='model',
+    parser.add_argument('--pretrain-data-dir', default=r'/home/mmslab/Desktop/jialing/SHA/clean',
+                        help='clean data directory for baseline and LoRA teacher')
+    parser.add_argument('--save-dir', default='weights',
                         help='directory to save models.')
     parser.add_argument('--save-all', type=bool, default=False,
                         help='whether to save all best model')
@@ -23,22 +23,22 @@ def parse_args():
                         help='the path of resume training model')
     parser.add_argument('--max-model-num', type=int, default=1,
                         help='max models num to save ')
-    parser.add_argument('--pretrain-epochs', type=int, default=10,
+    parser.add_argument('--pretrain-epochs', type=int, default=500,
                         help='number of base-model pretraining epochs')
     parser.add_argument('--pretrain-val-epoch', type=int, default=5,
                         help='validate the base model every N pretrain epochs')
     parser.add_argument('--pretrain-val-start', type=int, default=0,
                         help='first zero-based pretrain epoch eligible for validation')
 
-    parser.add_argument('--train-data-dir', default=r'/media/mmslab-1080/37E8097A1DE5832D/Kuan-Lun/counting_data/mix_data/ShanghaiTech_A_Train_Val_Test',
-                        help='LoRA/router training data directory')
+    parser.add_argument('--train-data-dir', default=r'/home/mmslab/Desktop/jialing/SHA/hazy',
+                        help='paired hazy data directory for LoRA/router training')
     parser.add_argument('--lr', '--lora-lr', dest='lr', type=float, default=5*1e-6,
                         help='learning rate for LoRA/router training')
     parser.add_argument('--weight-decay', '--lora-weight-decay', dest='weight_decay',
                         type=float, default=1e-5,
                         help='weight decay for LoRA/router training')
     parser.add_argument('--lora-epochs', '--max-epoch', dest='lora_epochs',
-                        type=int, default=10,
+                        type=int, default=1200,
                         help='number of LoRA/router training epochs')    
     parser.add_argument('--lora-val-epoch', '--val-epoch', dest='lora_val_epoch',
                         type=int, default=5,
@@ -50,9 +50,11 @@ def parse_args():
     #gamma是用於輔助損失的路由器偏差更新的學習率，控制了路由器偏差更新的速度
     parser.add_argument('--router-bias-update-rate', type=float, default=1e-3,
                         help='gamma for auxiliary-loss-free router bias updates')   
+    parser.add_argument('--cs-loss-weight', type=float, default=0.1,
+                        help='weight of paired clean-hazy cosine alignment loss')
     
     
-    parser.add_argument('--batch-size', type=int, default=4,
+    parser.add_argument('--batch-size', type=int, default=8,
                         help='train batch size')
     parser.add_argument('--device', default='0', help='assign device')
     parser.add_argument('--num-workers', type=int, default=8,
