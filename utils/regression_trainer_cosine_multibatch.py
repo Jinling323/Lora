@@ -302,10 +302,11 @@ class RegTrainer(Trainer):
                 self.model.enable_lora(True)
                 self.model.train()
                 outputs, features = self.model(inputs)
-                auxiliary_loss = self.args.cs_loss_weight * self._clean_hazy_cs_loss(
+                raw_cs_loss = self._clean_hazy_cs_loss(
                     features,
                     clean_features,
                 )
+                auxiliary_loss = self.args.cs_loss_weight * raw_cs_loss
 
             st_sizes = st_sizes.to(self.device) 
             ground_truth = np.asarray([len(point) for point in points], dtype=np.float32) 
@@ -328,23 +329,35 @@ class RegTrainer(Trainer):
             predicted = outputs.reshape(batch_size, -1).sum(dim=1).detach().cpu().numpy() 
             residual = predicted - ground_truth  
             loss_meter.update(loss.item(), batch_size) 
+            bayesian_loss_meter.update(bayesian_loss.item(), batch_size)
+            auxiliary_loss_meter.update(auxiliary_loss.item(), batch_size)
+            if stage_name == "lora":
+                raw_cs_loss_meter.update(raw_cs_loss.item(), batch_size)
             mse_meter.update(np.mean(residual ** 2), batch_size) 
             mae_meter.update(np.mean(np.abs(residual)), batch_size)  
             postfix = dict(
-                loss="{:.2f}".format(loss_meter.get_avg()),
+                total="{:.4f}".format(loss_meter.get_avg()),
+                bay="{:.4f}".format(bayesian_loss_meter.get_avg()),
+                aux="{:.4f}".format(auxiliary_loss_meter.get_avg()),
                 mse="{:.2f}".format(np.sqrt(mse_meter.get_avg())),
                 mae="{:.2f}".format(mae_meter.get_avg()),
             )
+            if stage_name == "lora":
+                postfix["raw_cs"] = "{:.4f}".format(raw_cs_loss_meter.get_avg())
             if router_maxvio is not None:
                 #新增maxvio到postfix，顯示最大違規比例
                 postfix["maxvio"] = "{:.3f}".format(router_maxvio) 
             progress.set_postfix(postfix)
 
         logging.info(  
-            "Epoch %s %s Train, Loss: %.2f, MSE: %.2f MAE: %.2f, Cost %.1f sec",
+            "Epoch %s %s Train, Total: %.4f, Bayesian: %.4f, "
+            "Auxiliary: %.4f, Raw CS: %.4f, RMSE: %.2f, MAE: %.2f, Cost %.1f sec",
             self.epoch,  
             stage_name,  
             loss_meter.get_avg(),  
+            bayesian_loss_meter.get_avg(),
+            auxiliary_loss_meter.get_avg(),
+            raw_cs_loss_meter.get_avg() if stage_name == "lora" else 0.0,
             np.sqrt(mse_meter.get_avg()),  
             mae_meter.get_avg(),  
             time.time() - start_time,  
@@ -355,6 +368,22 @@ class RegTrainer(Trainer):
             loss_meter.get_avg(),
             self.epoch,
         )
+        self.writer.add_scalar(
+            "{}/Bayesian_Loss".format(tensorboard_prefix),
+            bayesian_loss_meter.get_avg(),
+            self.epoch,
+        )
+        self.writer.add_scalar(
+            "{}/Auxiliary_Loss".format(tensorboard_prefix),
+            auxiliary_loss_meter.get_avg(),
+            self.epoch,
+        )
+        if stage_name == "lora":
+            self.writer.add_scalar(
+                "{}/Raw_CS_Loss".format(tensorboard_prefix),
+                raw_cs_loss_meter.get_avg(),
+                self.epoch,
+            )
         self.writer.add_scalar(
             "{}/Train_MAE".format(tensorboard_prefix),
             mae_meter.get_avg(),

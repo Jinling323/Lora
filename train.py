@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument('--pretrain-val-start', type=int, default=100,
                         help='first zero-based pretrain epoch eligible for validation')
 
-    parser.add_argument('--train-data-dir', default=r'/home/mmslab/Desktop/jialing/SHA/hazy',
+    parser.add_argument('--train-data-dir', default=r'/media/mmslab5090/SSD2/crowd counting test/sha/hazy',
                         help='paired hazy data directory for LoRA/router training')
     parser.add_argument('--lr', '--lora-lr', dest='lr', type=float, default=5*1e-5,
                         help='learning rate for LoRA/router training')
@@ -64,7 +64,7 @@ def parse_args():
     #gamma是用於輔助損失的路由器偏差更新的學習率，控制了路由器偏差更新的速度
     parser.add_argument('--router-bias-update-rate', type=float, default=1e-3,
                         help='gamma for auxiliary-loss-free router bias updates')   
-    parser.add_argument('--cs-loss-weight', type=float, default=0.1,
+    parser.add_argument('--cs-loss-weight', type=float, default=1.0,
                         help='weight of paired clean-hazy cosine alignment loss')
     
     
