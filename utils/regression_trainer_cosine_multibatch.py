@@ -1,5 +1,6 @@
 import logging 
 import os  
+import random
 import sys  
 import time 
 from math import ceil  
@@ -44,6 +45,14 @@ def paired_train_collate(batch):
     targets = columns[3]
     st_sizes = torch.FloatTensor(columns[4])
     return clean_images, hazy_images, points, targets, st_sizes
+
+
+def seed_worker(worker_id):
+    """Give each DataLoader worker a deterministic Python/NumPy seed."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 class RegTrainer(Trainer):  
@@ -202,6 +211,10 @@ class RegTrainer(Trainer):
     # 將 train/val datasets 包裝成 dataloaders
     def _make_dataloaders(self, datasets):  
         args = self.args  
+        generators = {
+            "train": torch.Generator().manual_seed(args.seed),
+            "val": torch.Generator().manual_seed(args.seed + 1),
+        }
         return { 
             split: DataLoader(  
                 datasets[split],  
@@ -215,6 +228,8 @@ class RegTrainer(Trainer):
                 shuffle=split == "train",  
                 num_workers=args.num_workers * self.device_count,  
                 pin_memory=split == "train",  
+                worker_init_fn=seed_worker,
+                generator=generators[split],
             )
             for split in ("train", "val")  # 同時建立 train 與 val loaders。
         }
@@ -243,7 +258,10 @@ class RegTrainer(Trainer):
 
     # 執行 base 或 LoRA 的一個 training epoch
     def _train_one_epoch(self, stage_name, stage):  
-        loss_meter = AverageMeter() 
+        loss_meter = AverageMeter()
+        bayesian_loss_meter = AverageMeter()
+        auxiliary_loss_meter = AverageMeter()
+        raw_cs_loss_meter = AverageMeter()
         mae_meter = AverageMeter() 
         mse_meter = AverageMeter() 
         start_time = time.time()  
@@ -370,6 +388,7 @@ class RegTrainer(Trainer):
             raise ValueError("clean and hazy feature layer counts do not match")
 
         layer_losses = []
+        # 把「相同 Transformer 層」的 hazy feature 和 clean feature 配對取出
         for hazy_feature, clean_feature in zip(hazy_features, clean_features):
             if hazy_feature.shape != clean_feature.shape:
                 raise ValueError(

@@ -148,7 +148,7 @@ class Crowd(data.Dataset):
         return self.trans(img), torch.from_numpy(keypoints.copy()).float(), \
                torch.from_numpy(target.copy()).float(), st_size
 
-
+# 自動配對 IMG_x.jpg 和 hazy_IMG_x.jpg
 class PairedCrowd(Crowd):
     """Return geometrically aligned clean/hazy crops for LoRA training."""
 
