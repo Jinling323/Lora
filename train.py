@@ -45,7 +45,13 @@ def parse_args():
                         help='first zero-based pretrain epoch eligible for validation')
 
     parser.add_argument('--train-data-dir', default=r'/media/mmslab5090/SSD2/crowd counting test/sha/hazy',
-                        help='paired hazy data directory for LoRA/router training')
+                        help='paired hazy data directory for the Fc/Fh cosine loss')
+    parser.add_argument('--main-train-data-dir',
+                        default=r'/media/mmslab5090/SSD2/crowd counting test/sha/mix',
+                        help='main crowd-counting data directory for LoRA/router training')
+    parser.add_argument('--val-data-dir',
+                        default=r'/media/mmslab5090/SSD2/crowd counting test/sha/mix',
+                        help='validation data directory for LoRA/router evaluation')
     parser.add_argument('--lr', '--lora-lr', dest='lr', type=float, default=5*1e-5,
                         help='learning rate for LoRA/router training')
     parser.add_argument('--weight-decay', '--lora-weight-decay', dest='weight_decay',
@@ -73,7 +79,7 @@ def parse_args():
     parser.add_argument('--device', default='0', help='assign device')
     parser.add_argument('--num-workers', type=int, default=8,
                         help='the num of training process')
-    parser.add_argument('--seed', type=int, default=None,
+    parser.add_argument('--seed', type=int, default=42,
                         help='random seed; omitted means generate and log a new seed')
 
     parser.add_argument('--is-gray', type=bool, default=False,

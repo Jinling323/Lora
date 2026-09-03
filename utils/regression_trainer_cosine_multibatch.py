@@ -69,14 +69,37 @@ class RegTrainer(Trainer):
         pretrain_data_dir = args.pretrain_data_dir or args.train_data_dir  
         self.pretrain_datasets = self._make_datasets(pretrain_data_dir)
         self.pretrain_dataloaders = self._make_dataloaders(self.pretrain_datasets)
-        self.datasets = self._make_lora_datasets(
-            pretrain_data_dir,
-            args.train_data_dir,
+        main_train_data_dir = args.main_train_data_dir or args.train_data_dir
+        val_data_dir = args.val_data_dir or main_train_data_dir
+        self.datasets = self._make_counting_datasets(
+            main_train_data_dir,
+            val_data_dir,
         )
         self.dataloaders = self._make_dataloaders(self.datasets)
+        self.paired_dataset = PairedCrowd(
+            os.path.join(pretrain_data_dir, "train"),
+            os.path.join(args.train_data_dir, "train"),
+            args.crop_size,
+            args.downsample_ratio,
+            args.is_gray,
+        )
+        if len(self.paired_dataset) == 0:
+            raise ValueError("paired clean/hazy training dataset is empty")
+        self.paired_dataloader = DataLoader(
+            self.paired_dataset,
+            collate_fn=paired_train_collate,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers * self.device_count,
+            pin_memory=True,
+            worker_init_fn=seed_worker,
+            generator=torch.Generator().manual_seed(args.seed + 2),
+        )
         logging.info("pretrain data directory: %s", pretrain_data_dir)  
-        logging.info("LoRA clean data directory: %s", pretrain_data_dir)
-        logging.info("LoRA hazy data directory: %s", args.train_data_dir)
+        logging.info("LoRA counting train directory: %s", main_train_data_dir)
+        logging.info("LoRA validation directory: %s", val_data_dir)
+        logging.info("cosine clean data directory: %s", pretrain_data_dir)
+        logging.info("cosine hazy data directory: %s", args.train_data_dir)
 
         self.model = vgg.vgg19_trans(  
             num_experts=4,  
@@ -189,18 +212,18 @@ class RegTrainer(Trainer):
             for split in ("train", "val")  
         }
 
-    def _make_lora_datasets(self, clean_data_dir, hazy_data_dir):
+    def _make_counting_datasets(self, train_data_dir, val_data_dir):
         args = self.args
         return {
-            "train": PairedCrowd(
-                os.path.join(clean_data_dir, "train"),
-                os.path.join(hazy_data_dir, "train"),
+            "train": Crowd(
+                os.path.join(train_data_dir, "train"),
                 args.crop_size,
                 args.downsample_ratio,
                 args.is_gray,
+                "train",
             ),
             "val": Crowd(
-                os.path.join(hazy_data_dir, "val"),
+                os.path.join(val_data_dir, "val"),
                 args.crop_size,
                 args.downsample_ratio,
                 args.is_gray,
@@ -262,6 +285,7 @@ class RegTrainer(Trainer):
         bayesian_loss_meter = AverageMeter()
         auxiliary_loss_meter = AverageMeter()
         raw_cs_loss_meter = AverageMeter()
+        hazy_ffn_observation = None
         mae_meter = AverageMeter() 
         mse_meter = AverageMeter() 
         start_time = time.time()  
@@ -271,6 +295,7 @@ class RegTrainer(Trainer):
         self.model.train()  
         self.model.zero_grad(set_to_none=True)  # 清除上一階段可能殘留的所有 gradients。
         train_loader = stage["loaders"]["train"]
+        paired_iterator = iter(self.paired_dataloader) if stage_name == "lora" else None
         progress = tqdm(
             train_loader,
             desc="{} epoch {}/{} train".format(stage["label"], self.epoch + 1, stage["epochs"]),
@@ -288,9 +313,30 @@ class RegTrainer(Trainer):
                 outputs, features = self.model(inputs)
                 auxiliary_loss = self._consistency_loss(features, outputs)
             else:
-                clean_inputs, inputs, points, targets, st_sizes = batch
-                clean_inputs = clean_inputs.to(self.device)
+                # The main loader supplies the crowd-counting supervision.
+                inputs, points, targets, st_sizes = batch
                 inputs = inputs.to(self.device)
+                self.model.enable_lora(True)
+                self.model.train()
+                outputs, _ = self.model(inputs)
+
+                # A separate paired loader supplies only the Fc/Fh constraint.
+                try:
+                    paired_batch = next(paired_iterator)
+                except StopIteration:
+                    paired_iterator = iter(self.paired_dataloader)
+                    paired_batch = next(paired_iterator)
+                clean_inputs, hazy_inputs, _, _, _ = paired_batch
+                clean_inputs = clean_inputs.to(self.device)
+                hazy_inputs = hazy_inputs.to(self.device)
+
+                # Observation only: measure how the final encoder layer's FFN
+                # (base + LoRA) changes the same hazy features.  This runs only
+                # once per epoch and never participates in optimization.
+                if hazy_ffn_observation is None:
+                    hazy_ffn_observation = self._measure_hazy_ffn_change(
+                        hazy_inputs
+                    )
 
                 # Clean teacher: frozen baseline with LoRA disabled.
                 self.model.enable_lora(False)
@@ -301,9 +347,9 @@ class RegTrainer(Trainer):
                 # Hazy student: only LoRA experts/router are trainable.
                 self.model.enable_lora(True)
                 self.model.train()
-                outputs, features = self.model(inputs)
+                _, hazy_features = self.model(hazy_inputs)
                 raw_cs_loss = self._clean_hazy_cs_loss(
-                    features,
+                    hazy_features,
                     clean_features,
                 )
                 auxiliary_loss = self.args.cs_loss_weight * raw_cs_loss
@@ -384,6 +430,17 @@ class RegTrainer(Trainer):
                 raw_cs_loss_meter.get_avg(),
                 self.epoch,
             )
+            if hazy_ffn_observation is not None:
+                self.writer.add_scalar(
+                    "Feature/Hazy_PreFFN_vs_PostFFN_CS_Distance",
+                    hazy_ffn_observation["cs_distance"],
+                    self.epoch,
+                )
+                self.writer.add_scalar(
+                    "Feature/Hazy_PreFFN_vs_PostFFN_Norm_Ratio",
+                    hazy_ffn_observation["norm_ratio"],
+                    self.epoch,
+                )
         self.writer.add_scalar(
             "{}/Train_MAE".format(tensorboard_prefix),
             mae_meter.get_avg(),
@@ -442,6 +499,60 @@ class RegTrainer(Trainer):
         if not layer_losses:
             raise RuntimeError("no returned feature is connected to LoRA parameters")
         return torch.stack(layer_losses).mean()
+
+    def _measure_hazy_ffn_change(self, hazy_inputs):
+        """Observe final-layer hazy features immediately before/after FFN."""
+        captured = {}
+        final_layer = self.model.encoder.layers[-1]
+
+        def capture_pre_ffn(module, inputs):
+            del module
+            captured["pre"] = inputs[0].detach()
+
+        def capture_post_ffn(module, inputs, output):
+            del module, inputs
+            captured["post"] = output.detach()
+
+        pre_handle = final_layer.linear1.register_forward_pre_hook(capture_pre_ffn)
+        post_handle = final_layer.norm2.register_forward_hook(capture_post_ffn)
+        self.model.eval()
+        try:
+            self.model.enable_lora(True)
+            with torch.no_grad():
+                self.model(hazy_inputs)
+        finally:
+            pre_handle.remove()
+            post_handle.remove()
+
+        # Restore the state required by the remainder of the LoRA train step.
+        self.model.enable_lora(True)
+        self.model.train()
+
+        if "pre" not in captured or "post" not in captured:
+            raise RuntimeError("failed to capture final-layer FFN features")
+        pre_feature = captured["pre"]
+        post_feature = captured["post"]
+        if pre_feature.shape != post_feature.shape:
+            raise ValueError(
+                "pre/post FFN feature shapes do not match: {} vs {}".format(
+                    tuple(pre_feature.shape), tuple(post_feature.shape)
+                )
+            )
+
+        cs_distance = 1.0 - F.cosine_similarity(
+            pre_feature,
+            post_feature,
+            dim=-1,
+            eps=1e-8,
+        ).mean()
+        norm_ratio = (
+            post_feature.norm(dim=-1)
+            / pre_feature.norm(dim=-1).clamp_min(1e-8)
+        ).mean()
+        return {
+            "cs_distance": cs_distance.item(),
+            "norm_ratio": norm_ratio.item(),
+        }
 
     # 驗證 base-only 或 frozen-base + LoRA/router
     def _validate(self, stage_name, dataloader):  
