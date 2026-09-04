@@ -285,7 +285,7 @@ class RegTrainer(Trainer):
         bayesian_loss_meter = AverageMeter()
         auxiliary_loss_meter = AverageMeter()
         raw_cs_loss_meter = AverageMeter()
-        hazy_ffn_observation = None
+        feature_observation = None
         mae_meter = AverageMeter() 
         mse_meter = AverageMeter() 
         start_time = time.time()  
@@ -330,12 +330,13 @@ class RegTrainer(Trainer):
                 clean_inputs = clean_inputs.to(self.device)
                 hazy_inputs = hazy_inputs.to(self.device)
 
-                # Observation only: measure how the final encoder layer's FFN
-                # (base + LoRA) changes the same hazy features.  This runs only
-                # once per epoch and never participates in optimization.
-                if hazy_ffn_observation is None:
-                    hazy_ffn_observation = self._measure_hazy_ffn_change(
-                        hazy_inputs
+                # Observation only: on the first paired batch, measure the
+                # clean/hazy gap after layer-0 attention and the change from
+                # that hazy feature to the final LoRA encoder feature.
+                if feature_observation is None:
+                    feature_observation = self._measure_feature_differences(
+                        clean_inputs,
+                        hazy_inputs,
                     )
 
                 # Clean teacher: frozen baseline with LoRA disabled.
@@ -430,15 +431,15 @@ class RegTrainer(Trainer):
                 raw_cs_loss_meter.get_avg(),
                 self.epoch,
             )
-            if hazy_ffn_observation is not None:
+            if feature_observation is not None:
                 self.writer.add_scalar(
-                    "Feature/Hazy_PreFFN_vs_PostFFN_CS_Distance",
-                    hazy_ffn_observation["cs_distance"],
+                    "Feature/Layer0_HazyPostAttention_vs_CleanBaseline_CS_Distance",
+                    feature_observation["layer0_hazy_vs_clean"],
                     self.epoch,
                 )
                 self.writer.add_scalar(
-                    "Feature/Hazy_PreFFN_vs_PostFFN_Norm_Ratio",
-                    hazy_ffn_observation["norm_ratio"],
+                    "Feature/Layer0_HazyPostAttention_vs_FinalFh_CS_Distance",
+                    feature_observation["layer0_hazy_vs_final"],
                     self.epoch,
                 )
         self.writer.add_scalar(
@@ -500,58 +501,74 @@ class RegTrainer(Trainer):
             raise RuntimeError("no returned feature is connected to LoRA parameters")
         return torch.stack(layer_losses).mean()
 
-    def _measure_hazy_ffn_change(self, hazy_inputs):
-        """Observe final-layer hazy features immediately before/after FFN."""
+    def _measure_feature_differences(self, clean_inputs, hazy_inputs):
+        """Observe selected clean/hazy features without affecting training."""
         captured = {}
+        layer_zero = self.model.encoder.layers[0]
         final_layer = self.model.encoder.layers[-1]
 
-        def capture_pre_ffn(module, inputs):
-            del module
-            captured["pre"] = inputs[0].detach()
-
-        def capture_post_ffn(module, inputs, output):
+        def capture_layer_zero_post_attention(module, inputs, output):
             del module, inputs
-            captured["post"] = output.detach()
+            captured["layer0_post_attention"] = output.detach()
 
-        pre_handle = final_layer.linear1.register_forward_pre_hook(capture_pre_ffn)
-        post_handle = final_layer.norm2.register_forward_hook(capture_post_ffn)
+        def capture_final_feature(module, inputs, output):
+            del module, inputs
+            captured["final"] = output.detach()
+
+        layer_zero_handle = layer_zero.norm1.register_forward_hook(
+            capture_layer_zero_post_attention
+        )
+        final_handle = final_layer.norm2.register_forward_hook(
+            capture_final_feature
+        )
         self.model.eval()
         try:
-            self.model.enable_lora(True)
             with torch.no_grad():
+                self.model.enable_lora(False)
+                self.model(clean_inputs)
+                clean_layer_zero = captured["layer0_post_attention"]
+
+                captured.clear()
+                self.model.enable_lora(True)
                 self.model(hazy_inputs)
+                hazy_layer_zero = captured["layer0_post_attention"]
+                final_hazy = captured["final"]
         finally:
-            pre_handle.remove()
-            post_handle.remove()
+            layer_zero_handle.remove()
+            final_handle.remove()
 
         # Restore the state required by the remainder of the LoRA train step.
         self.model.enable_lora(True)
         self.model.train()
 
-        if "pre" not in captured or "post" not in captured:
-            raise RuntimeError("failed to capture final-layer FFN features")
-        pre_feature = captured["pre"]
-        post_feature = captured["post"]
-        if pre_feature.shape != post_feature.shape:
+        if clean_layer_zero.shape != hazy_layer_zero.shape:
             raise ValueError(
-                "pre/post FFN feature shapes do not match: {} vs {}".format(
-                    tuple(pre_feature.shape), tuple(post_feature.shape)
+                "clean/hazy layer-0 feature shapes do not match: {} vs {}".format(
+                    tuple(clean_layer_zero.shape), tuple(hazy_layer_zero.shape)
+                )
+            )
+        if hazy_layer_zero.shape != final_hazy.shape:
+            raise ValueError(
+                "layer-0/final hazy feature shapes do not match: {} vs {}".format(
+                    tuple(hazy_layer_zero.shape), tuple(final_hazy.shape)
                 )
             )
 
-        cs_distance = 1.0 - F.cosine_similarity(
-            pre_feature,
-            post_feature,
+        layer0_hazy_vs_clean = 1.0 - F.cosine_similarity(
+            hazy_layer_zero,
+            clean_layer_zero,
             dim=-1,
             eps=1e-8,
         ).mean()
-        norm_ratio = (
-            post_feature.norm(dim=-1)
-            / pre_feature.norm(dim=-1).clamp_min(1e-8)
+        layer0_hazy_vs_final = 1.0 - F.cosine_similarity(
+            hazy_layer_zero,
+            final_hazy,
+            dim=-1,
+            eps=1e-8,
         ).mean()
         return {
-            "cs_distance": cs_distance.item(),
-            "norm_ratio": norm_ratio.item(),
+            "layer0_hazy_vs_clean": layer0_hazy_vs_clean.item(),
+            "layer0_hazy_vs_final": layer0_hazy_vs_final.item(),
         }
 
     # 驗證 base-only 或 frozen-base + LoRA/router
